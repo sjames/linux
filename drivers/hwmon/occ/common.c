@@ -2,11 +2,13 @@
 // Copyright IBM Corp 2019
 
 #include <linux/device.h>
+#include <linux/export.h>
 #include <linux/hwmon.h>
 #include <linux/hwmon-sysfs.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/math64.h>
+#include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/sysfs.h>
 #include <asm/unaligned.h>
@@ -37,6 +39,14 @@ struct temp_sensor_2 {
 	u32 sensor_id;
 	u8 fru_type;
 	u8 value;
+} __packed;
+
+struct temp_sensor_10 {
+	u32 sensor_id;
+	u8 fru_type;
+	u8 value;
+	u8 throttle;
+	u8 reserved;
 } __packed;
 
 struct freq_sensor_1 {
@@ -122,12 +132,12 @@ struct extended_sensor {
 static int occ_poll(struct occ *occ)
 {
 	int rc;
-	u16 checksum = occ->poll_cmd_data + 1;
+	u16 checksum = occ->poll_cmd_data + occ->seq_no + 1;
 	u8 cmd[8];
 	struct occ_poll_response_header *header;
 
 	/* big endian */
-	cmd[0] = 0;			/* sequence number */
+	cmd[0] = occ->seq_no++;		/* sequence number */
 	cmd[1] = 0;			/* cmd type */
 	cmd[2] = 0;			/* data length msb */
 	cmd[3] = 1;			/* data length lsb */
@@ -139,6 +149,7 @@ static int occ_poll(struct occ *occ)
 	/* mutex should already be locked if necessary */
 	rc = occ->send_cmd(occ, cmd);
 	if (rc) {
+		occ->last_error = rc;
 		if (occ->error_count++ > OCC_ERROR_COUNT_THRESHOLD)
 			occ->error = rc;
 
@@ -147,6 +158,7 @@ static int occ_poll(struct occ *occ)
 
 	/* clear error since communication was successful */
 	occ->error_count = 0;
+	occ->last_error = 0;
 	occ->error = 0;
 
 	/* check for safe state */
@@ -208,6 +220,8 @@ int occ_update_response(struct occ *occ)
 	if (time_after(jiffies, occ->last_update + OCC_UPDATE_FREQUENCY)) {
 		rc = occ_poll(occ);
 		occ->last_update = jiffies;
+	} else {
+		rc = occ->last_error;
 	}
 
 	mutex_unlock(&occ->lock);
@@ -235,6 +249,12 @@ static ssize_t occ_show_temp_1(struct device *dev,
 		val = get_unaligned_be16(&temp->sensor_id);
 		break;
 	case 1:
+		/*
+		 * If a sensor reading has expired and couldn't be refreshed,
+		 * OCC returns 0xFFFF for that sensor.
+		 */
+		if (temp->value == 0xFFFF)
+			return -EREMOTEIO;
 		val = get_unaligned_be16(&temp->value) * 1000;
 		break;
 	default:
@@ -287,6 +307,60 @@ static ssize_t occ_show_temp_2(struct device *dev,
 		break;
 	case 3:
 		val = temp->value == OCC_TEMP_SENSOR_FAULT;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return snprintf(buf, PAGE_SIZE - 1, "%u\n", val);
+}
+
+static ssize_t occ_show_temp_10(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	int rc;
+	u32 val = 0;
+	struct temp_sensor_10 *temp;
+	struct occ *occ = dev_get_drvdata(dev);
+	struct occ_sensors *sensors = &occ->sensors;
+	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
+
+	rc = occ_update_response(occ);
+	if (rc)
+		return rc;
+
+	temp = ((struct temp_sensor_10 *)sensors->temp.data) + sattr->index;
+
+	switch (sattr->nr) {
+	case 0:
+		val = get_unaligned_be32(&temp->sensor_id);
+		break;
+	case 1:
+		val = temp->value;
+		if (val == OCC_TEMP_SENSOR_FAULT)
+			return -EREMOTEIO;
+
+		/*
+		 * VRM doesn't return temperature, only alarm bit. This
+		 * attribute maps to tempX_alarm instead of tempX_input for
+		 * VRM
+		 */
+		if (temp->fru_type != OCC_FRU_TYPE_VRM) {
+			/* sensor not ready */
+			if (val == 0)
+				return -EAGAIN;
+
+			val *= 1000;
+		}
+		break;
+	case 2:
+		val = temp->fru_type;
+		break;
+	case 3:
+		val = temp->value == OCC_TEMP_SENSOR_FAULT;
+		break;
+	case 4:
+		val = temp->throttle * 1000;
 		break;
 	default:
 		return -EINVAL;
@@ -396,8 +470,10 @@ static ssize_t occ_show_power_1(struct device *dev,
 
 static u64 occ_get_powr_avg(u64 *accum, u32 *samples)
 {
-	return div64_u64(get_unaligned_be64(accum) * 1000000ULL,
-			 get_unaligned_be32(samples));
+	u64 divisor = get_unaligned_be32(samples);
+
+	return (divisor == 0) ? 0 :
+		div64_u64(get_unaligned_be64(accum) * 1000000ULL, divisor);
 }
 
 static ssize_t occ_show_power_2(struct device *dev,
@@ -731,6 +807,10 @@ static int occ_setup_sensor_attrs(struct occ *occ)
 		num_attrs += (sensors->temp.num_sensors * 4);
 		show_temp = occ_show_temp_2;
 		break;
+	case 0x10:
+		num_attrs += (sensors->temp.num_sensors * 5);
+		show_temp = occ_show_temp_10;
+		break;
 	default:
 		sensors->temp.num_sensors = 0;
 	}
@@ -738,7 +818,7 @@ static int occ_setup_sensor_attrs(struct occ *occ)
 	switch (sensors->freq.version) {
 	case 2:
 		show_freq = occ_show_freq_2;
-		/* fall through */
+		fallthrough;
 	case 1:
 		num_attrs += (sensors->freq.num_sensors * 2);
 		break;
@@ -749,7 +829,7 @@ static int occ_setup_sensor_attrs(struct occ *occ)
 	switch (sensors->power.version) {
 	case 2:
 		show_power = occ_show_power_2;
-		/* fall through */
+		fallthrough;
 	case 1:
 		num_attrs += (sensors->power.num_sensors * 4);
 		break;
@@ -767,7 +847,7 @@ static int occ_setup_sensor_attrs(struct occ *occ)
 		break;
 	case 3:
 		show_caps = occ_show_caps_3;
-		/* fall through */
+		fallthrough;
 	case 2:
 		num_attrs += (sensors->caps.num_sensors * 8);
 		break;
@@ -830,6 +910,15 @@ static int occ_setup_sensor_attrs(struct occ *occ)
 			attr->sensor = OCC_INIT_ATTR(attr->name, 0444,
 						     show_temp, NULL, 3, i);
 			attr++;
+
+			if (sensors->temp.version == 0x10) {
+				snprintf(attr->name, sizeof(attr->name),
+					 "temp%d_max", s);
+				attr->sensor = OCC_INIT_ATTR(attr->name, 0444,
+							     show_temp, NULL,
+							     4, i);
+				attr++;
+			}
 		}
 	}
 
@@ -1099,3 +1188,8 @@ int occ_setup(struct occ *occ, const char *name)
 
 	return rc;
 }
+EXPORT_SYMBOL_GPL(occ_setup);
+
+MODULE_AUTHOR("Eddie James <eajames@linux.ibm.com>");
+MODULE_DESCRIPTION("Common OCC hwmon code");
+MODULE_LICENSE("GPL");

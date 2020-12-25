@@ -1,9 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2008-2014 Patrick McHardy <kaber@trash.net>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
  *
  * Development of this code funded by Astaro AG (http://www.astaro.com/)
  */
@@ -19,7 +16,7 @@
 #include <linux/rhashtable.h>
 #include <linux/netfilter.h>
 #include <linux/netfilter/nf_tables.h>
-#include <net/netfilter/nf_tables.h>
+#include <net/netfilter/nf_tables_core.h>
 
 /* We target a hash table size of 4, element hint is 75% of final size */
 #define NFT_RHASH_ELEMENT_HINT 3
@@ -237,6 +234,24 @@ static void nft_rhash_remove(const struct net *net,
 	rhashtable_remove_fast(&priv->ht, &he->node, nft_rhash_params);
 }
 
+static bool nft_rhash_delete(const struct nft_set *set,
+			     const u32 *key)
+{
+	struct nft_rhash *priv = nft_set_priv(set);
+	struct nft_rhash_cmp_arg arg = {
+		.genmask = NFT_GENMASK_ANY,
+		.set = set,
+		.key = key,
+	};
+	struct nft_rhash_elem *he;
+
+	he = rhashtable_lookup(&priv->ht, &arg, nft_rhash_params);
+	if (he == NULL)
+		return false;
+
+	return rhashtable_remove_fast(&priv->ht, &he->node, nft_rhash_params) == 0;
+}
+
 static void nft_rhash_walk(const struct nft_ctx *ctx, struct nft_set *set,
 			   struct nft_set_iter *iter)
 {
@@ -278,6 +293,22 @@ cont:
 	rhashtable_walk_exit(&hti);
 }
 
+static bool nft_rhash_expr_needs_gc_run(const struct nft_set *set,
+					struct nft_set_ext *ext)
+{
+	struct nft_set_elem_expr *elem_expr = nft_set_ext_expr(ext);
+	struct nft_expr *expr;
+	u32 size;
+
+	nft_setelem_expr_foreach(expr, elem_expr, size) {
+		if (expr->ops->gc &&
+		    expr->ops->gc(read_pnet(&set->net), expr))
+			return true;
+	}
+
+	return false;
+}
+
 static void nft_rhash_gc(struct work_struct *work)
 {
 	struct nft_set *set;
@@ -299,16 +330,13 @@ static void nft_rhash_gc(struct work_struct *work)
 			continue;
 		}
 
-		if (nft_set_ext_exists(&he->ext, NFT_SET_EXT_EXPR)) {
-			struct nft_expr *expr = nft_set_ext_expr(&he->ext);
+		if (nft_set_ext_exists(&he->ext, NFT_SET_EXT_EXPRESSIONS) &&
+		    nft_rhash_expr_needs_gc_run(set, &he->ext))
+			goto needs_gc_run;
 
-			if (expr->ops->gc &&
-			    expr->ops->gc(read_pnet(&set->net), expr))
-				goto gc;
-		}
 		if (!nft_set_elem_expired(&he->ext))
 			continue;
-gc:
+needs_gc_run:
 		if (nft_set_elem_mark_busy(&he->ext))
 			continue;
 
@@ -630,7 +658,7 @@ static bool nft_hash_estimate(const struct nft_set_desc *desc, u32 features,
 }
 
 static bool nft_hash_fast_estimate(const struct nft_set_desc *desc, u32 features,
-			      struct nft_set_estimate *est)
+				   struct nft_set_estimate *est)
 {
 	if (!desc->size)
 		return false;
@@ -647,8 +675,7 @@ static bool nft_hash_fast_estimate(const struct nft_set_desc *desc, u32 features
 	return true;
 }
 
-struct nft_set_type nft_set_rhash_type __read_mostly = {
-	.owner		= THIS_MODULE,
+const struct nft_set_type nft_set_rhash_type = {
 	.features	= NFT_SET_MAP | NFT_SET_OBJECT |
 			  NFT_SET_TIMEOUT | NFT_SET_EVAL,
 	.ops		= {
@@ -665,13 +692,13 @@ struct nft_set_type nft_set_rhash_type __read_mostly = {
 		.remove		= nft_rhash_remove,
 		.lookup		= nft_rhash_lookup,
 		.update		= nft_rhash_update,
+		.delete		= nft_rhash_delete,
 		.walk		= nft_rhash_walk,
 		.get		= nft_rhash_get,
 	},
 };
 
-struct nft_set_type nft_set_hash_type __read_mostly = {
-	.owner		= THIS_MODULE,
+const struct nft_set_type nft_set_hash_type = {
 	.features	= NFT_SET_MAP | NFT_SET_OBJECT,
 	.ops		= {
 		.privsize       = nft_hash_privsize,
@@ -690,8 +717,7 @@ struct nft_set_type nft_set_hash_type __read_mostly = {
 	},
 };
 
-struct nft_set_type nft_set_hash_fast_type __read_mostly = {
-	.owner		= THIS_MODULE,
+const struct nft_set_type nft_set_hash_fast_type = {
 	.features	= NFT_SET_MAP | NFT_SET_OBJECT,
 	.ops		= {
 		.privsize       = nft_hash_privsize,

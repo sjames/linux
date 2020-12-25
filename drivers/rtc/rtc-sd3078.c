@@ -192,11 +192,9 @@ static int sd3078_probe(struct i2c_client *client,
 	sd3078->rtc->range_min = RTC_TIMESTAMP_BEGIN_2000;
 	sd3078->rtc->range_max = RTC_TIMESTAMP_END_2099;
 
-	ret = rtc_register_device(sd3078->rtc);
-	if (ret) {
-		dev_err(&client->dev, "failed to register rtc device\n");
+	ret = devm_rtc_register_device(sd3078->rtc);
+	if (ret)
 		return ret;
-	}
 
 	sd3078_enable_reg_write(sd3078);
 

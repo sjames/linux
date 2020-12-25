@@ -8,6 +8,8 @@
 #ifndef GOYA_FW_IF_H
 #define GOYA_FW_IF_H
 
+#define GOYA_EVENT_QUEUE_MSIX_IDX	5
+
 #define CPU_BOOT_ADDR		0x7FF8040000ull
 
 #define UBOOT_FW_OFFSET		0x100000		/* 1MB in SRAM */
@@ -20,7 +22,8 @@ enum goya_pll_index {
 	MME_PLL,
 	PCI_PLL,
 	EMMC_PLL,
-	TPC_PLL
+	TPC_PLL,
+	PLL_MAX
 };
 
 #define GOYA_PLL_FREQ_LOW		50000000 /* 50 MHz */

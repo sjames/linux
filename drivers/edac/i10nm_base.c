@@ -6,27 +6,32 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/io.h>
 #include <asm/cpu_device_id.h>
 #include <asm/intel-family.h>
 #include <asm/mce.h>
 #include "edac_module.h"
 #include "skx_common.h"
 
-#define I10NM_REVISION	"v0.0.3"
+#define I10NM_REVISION	"v0.0.4"
 #define EDAC_MOD_STR	"i10nm_edac"
 
 /* Debug macros */
 #define i10nm_printk(level, fmt, arg...)	\
 	edac_printk(level, "i10nm", fmt, ##arg)
 
-#define I10NM_GET_SCK_BAR(d, reg)		\
+#define I10NM_GET_SCK_BAR(d, reg)	\
 	pci_read_config_dword((d)->uracu, 0xd0, &(reg))
 #define I10NM_GET_IMC_BAR(d, i, reg)	\
 	pci_read_config_dword((d)->uracu, 0xd8 + (i) * 4, &(reg))
 #define I10NM_GET_DIMMMTR(m, i, j)	\
-	(*(u32 *)((m)->mbase + 0x2080c + (i) * 0x4000 + (j) * 4))
+	readl((m)->mbase + 0x2080c + (i) * (m)->chan_mmio_sz + (j) * 4)
 #define I10NM_GET_MCDDRTCFG(m, i, j)	\
-	(*(u32 *)((m)->mbase + 0x20970 + (i) * 0x4000 + (j) * 4))
+	readl((m)->mbase + 0x20970 + (i) * (m)->chan_mmio_sz + (j) * 4)
+#define I10NM_GET_MCMTR(m, i)		\
+	readl((m)->mbase + 0x20ef8 + (i) * (m)->chan_mmio_sz)
+#define I10NM_GET_AMAP(m, i)		\
+	readl((m)->mbase + 0x20814 + (i) * (m)->chan_mmio_sz)
 
 #define I10NM_GET_SCK_MMIO_BASE(reg)	(GET_BITFIELD(reg, 0, 28) << 23)
 #define I10NM_GET_IMC_MMIO_OFFSET(reg)	(GET_BITFIELD(reg, 0, 10) << 12)
@@ -122,9 +127,36 @@ static int i10nm_get_all_munits(void)
 	return 0;
 }
 
+static struct res_config i10nm_cfg0 = {
+	.type			= I10NM,
+	.decs_did		= 0x3452,
+	.busno_cfg_offset	= 0xcc,
+	.ddr_chan_mmio_sz	= 0x4000,
+};
+
+static struct res_config i10nm_cfg1 = {
+	.type			= I10NM,
+	.decs_did		= 0x3452,
+	.busno_cfg_offset	= 0xd0,
+	.ddr_chan_mmio_sz	= 0x4000,
+};
+
+static struct res_config spr_cfg = {
+	.type			= SPR,
+	.decs_did		= 0x3252,
+	.busno_cfg_offset	= 0xd0,
+	.ddr_chan_mmio_sz	= 0x8000,
+	.support_ddr5		= true,
+};
+
 static const struct x86_cpu_id i10nm_cpuids[] = {
-	{ X86_VENDOR_INTEL, 6, INTEL_FAM6_ATOM_TREMONT_X, 0, 0 },
-	{ }
+	X86_MATCH_INTEL_FAM6_MODEL_STEPPINGS(ATOM_TREMONT_D,	X86_STEPPINGS(0x0, 0x3), &i10nm_cfg0),
+	X86_MATCH_INTEL_FAM6_MODEL_STEPPINGS(ATOM_TREMONT_D,	X86_STEPPINGS(0x4, 0xf), &i10nm_cfg1),
+	X86_MATCH_INTEL_FAM6_MODEL_STEPPINGS(ICELAKE_X,		X86_STEPPINGS(0x0, 0x3), &i10nm_cfg0),
+	X86_MATCH_INTEL_FAM6_MODEL_STEPPINGS(ICELAKE_X,		X86_STEPPINGS(0x4, 0xf), &i10nm_cfg1),
+	X86_MATCH_INTEL_FAM6_MODEL_STEPPINGS(ICELAKE_D,		X86_STEPPINGS(0x0, 0xf), &i10nm_cfg1),
+	X86_MATCH_INTEL_FAM6_MODEL_STEPPINGS(SAPPHIRERAPIDS_X,	X86_STEPPINGS(0x0, 0xf), &spr_cfg),
+	{}
 };
 MODULE_DEVICE_TABLE(x86cpu, i10nm_cpuids);
 
@@ -132,18 +164,19 @@ static bool i10nm_check_ecc(struct skx_imc *imc, int chan)
 {
 	u32 mcmtr;
 
-	mcmtr = *(u32 *)(imc->mbase + 0x20ef8 + chan * 0x4000);
+	mcmtr = I10NM_GET_MCMTR(imc, chan);
 	edac_dbg(1, "ch%d mcmtr reg %x\n", chan, mcmtr);
 
 	return !!GET_BITFIELD(mcmtr, 2, 2);
 }
 
-static int i10nm_get_dimm_config(struct mem_ctl_info *mci)
+static int i10nm_get_dimm_config(struct mem_ctl_info *mci,
+				 struct res_config *cfg)
 {
 	struct skx_pvt *pvt = mci->pvt_info;
 	struct skx_imc *imc = pvt->imc;
+	u32 mtr, amap, mcddrtcfg;
 	struct dimm_info *dimm;
-	u32 mtr, mcddrtcfg;
 	int i, j, ndimms;
 
 	for (i = 0; i < I10NM_NUM_CHANNELS; i++) {
@@ -151,24 +184,24 @@ static int i10nm_get_dimm_config(struct mem_ctl_info *mci)
 			continue;
 
 		ndimms = 0;
+		amap = I10NM_GET_AMAP(imc, i);
 		for (j = 0; j < I10NM_NUM_DIMMS; j++) {
-			dimm = EDAC_DIMM_PTR(mci->layers, mci->dimms,
-					     mci->n_layers, i, j, 0);
+			dimm = edac_get_dimm(mci, i, j, 0);
 			mtr = I10NM_GET_DIMMMTR(imc, i, j);
 			mcddrtcfg = I10NM_GET_MCDDRTCFG(imc, i, j);
 			edac_dbg(1, "dimmmtr 0x%x mcddrtcfg 0x%x (mc%d ch%d dimm%d)\n",
 				 mtr, mcddrtcfg, imc->mc, i, j);
 
 			if (IS_DIMM_PRESENT(mtr))
-				ndimms += skx_get_dimm_info(mtr, 0, dimm,
-							    imc, i, j);
+				ndimms += skx_get_dimm_info(mtr, 0, amap, dimm,
+							    imc, i, j, cfg);
 			else if (IS_NVDIMM_PRESENT(mcddrtcfg, j))
 				ndimms += skx_get_nvdimm_info(dimm, imc, i, j,
 							      EDAC_MOD_STR);
 		}
-		if (ndimms && !i10nm_check_ecc(imc, 0)) {
-			i10nm_printk(KERN_ERR, "ECC is disabled on imc %d\n",
-				     imc->mc);
+		if (ndimms && !i10nm_check_ecc(imc, i)) {
+			i10nm_printk(KERN_ERR, "ECC is disabled on imc %d channel %d\n",
+				     imc->mc, i);
 			return -ENODEV;
 		}
 	}
@@ -181,10 +214,59 @@ static struct notifier_block i10nm_mce_dec = {
 	.priority	= MCE_PRIO_EDAC,
 };
 
+#ifdef CONFIG_EDAC_DEBUG
+/*
+ * Debug feature.
+ * Exercise the address decode logic by writing an address to
+ * /sys/kernel/debug/edac/i10nm_test/addr.
+ */
+static struct dentry *i10nm_test;
+
+static int debugfs_u64_set(void *data, u64 val)
+{
+	struct mce m;
+
+	pr_warn_once("Fake error to 0x%llx injected via debugfs\n", val);
+
+	memset(&m, 0, sizeof(m));
+	/* ADDRV + MemRd + Unknown channel */
+	m.status = MCI_STATUS_ADDRV + 0x90;
+	/* One corrected error */
+	m.status |= BIT_ULL(MCI_STATUS_CEC_SHIFT);
+	m.addr = val;
+	skx_mce_check_error(NULL, 0, &m);
+
+	return 0;
+}
+DEFINE_SIMPLE_ATTRIBUTE(fops_u64_wo, NULL, debugfs_u64_set, "%llu\n");
+
+static void setup_i10nm_debug(void)
+{
+	i10nm_test = edac_debugfs_create_dir("i10nm_test");
+	if (!i10nm_test)
+		return;
+
+	if (!edac_debugfs_create_file("addr", 0200, i10nm_test,
+				      NULL, &fops_u64_wo)) {
+		debugfs_remove(i10nm_test);
+		i10nm_test = NULL;
+	}
+}
+
+static void teardown_i10nm_debug(void)
+{
+	debugfs_remove_recursive(i10nm_test);
+}
+#else
+static inline void setup_i10nm_debug(void) {}
+static inline void teardown_i10nm_debug(void) {}
+#endif /*CONFIG_EDAC_DEBUG*/
+
 static int __init i10nm_init(void)
 {
 	u8 mc = 0, src_id = 0, node_id = 0;
 	const struct x86_cpu_id *id;
+	struct res_config *cfg;
 	const char *owner;
 	struct skx_dev *d;
 	int rc, i, off[3] = {0xd0, 0xc8, 0xcc};
@@ -200,11 +282,13 @@ static int __init i10nm_init(void)
 	if (!id)
 		return -ENODEV;
 
+	cfg = (struct res_config *)id->driver_data;
+
 	rc = skx_get_hi_lo(0x09a2, off, &tolm, &tohm);
 	if (rc)
 		return rc;
 
-	rc = skx_get_all_bus_mappings(0x3452, 0xcc, I10NM, &i10nm_edac_list);
+	rc = skx_get_all_bus_mappings(cfg, &i10nm_edac_list);
 	if (rc < 0)
 		goto fail;
 	if (rc == 0) {
@@ -217,7 +301,7 @@ static int __init i10nm_init(void)
 		goto fail;
 
 	list_for_each_entry(d, i10nm_edac_list, list) {
-		rc = skx_get_src_id(d, &src_id);
+		rc = skx_get_src_id(d, 0xf8, &src_id);
 		if (rc < 0)
 			goto fail;
 
@@ -234,10 +318,11 @@ static int __init i10nm_init(void)
 			d->imc[i].lmc = i;
 			d->imc[i].src_id  = src_id;
 			d->imc[i].node_id = node_id;
+			d->imc[i].chan_mmio_sz = cfg->ddr_chan_mmio_sz;
 
 			rc = skx_register_mci(&d->imc[i], d->imc[i].mdev,
 					      "Intel_10nm Socket", EDAC_MOD_STR,
-					      i10nm_get_dimm_config);
+					      i10nm_get_dimm_config, cfg);
 			if (rc < 0)
 				goto fail;
 		}
@@ -249,7 +334,7 @@ static int __init i10nm_init(void)
 
 	opstate_init();
 	mce_register_decode_chain(&i10nm_mce_dec);
-	setup_skx_debug("i10nm_test");
+	setup_i10nm_debug();
 
 	i10nm_printk(KERN_INFO, "%s\n", I10NM_REVISION);
 
@@ -262,7 +347,7 @@ fail:
 static void __exit i10nm_exit(void)
 {
 	edac_dbg(2, "\n");
-	teardown_skx_debug();
+	teardown_i10nm_debug();
 	mce_unregister_decode_chain(&i10nm_mce_dec);
 	skx_adxl_put();
 	skx_remove();

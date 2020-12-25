@@ -108,8 +108,9 @@
 	BPF_EXIT_INSN(),
 	},
 	.fixup_map_hash_8b = { 3 },
-	.errstr = "invalid indirect read from stack off -8+0 size 8",
-	.result = REJECT,
+	.errstr_unpriv = "invalid indirect read from stack off -8+0 size 8",
+	.result_unpriv = REJECT,
+	.result = ACCEPT,
 },
 {
 	"unpriv: mangle pointer on stack 1",
@@ -242,7 +243,7 @@
 	.insns = {
 	BPF_MOV64_REG(BPF_REG_8, BPF_REG_1),
 	/* struct bpf_sock *sock = bpf_sock_lookup(...); */
-	BPF_SK_LOOKUP,
+	BPF_SK_LOOKUP(sk_lookup_tcp),
 	BPF_MOV64_REG(BPF_REG_2, BPF_REG_0),
 	/* u64 foo; */
 	/* void *target = &foo; */
@@ -276,7 +277,7 @@
 	.insns = {
 	BPF_MOV64_REG(BPF_REG_8, BPF_REG_1),
 	/* struct bpf_sock *sock = bpf_sock_lookup(...); */
-	BPF_SK_LOOKUP,
+	BPF_SK_LOOKUP(sk_lookup_tcp),
 	BPF_MOV64_REG(BPF_REG_2, BPF_REG_0),
 	/* u64 foo; */
 	/* void *target = &foo; */
@@ -307,7 +308,7 @@
 	.insns = {
 	BPF_MOV64_REG(BPF_REG_8, BPF_REG_1),
 	/* struct bpf_sock *sock = bpf_sock_lookup(...); */
-	BPF_SK_LOOKUP,
+	BPF_SK_LOOKUP(sk_lookup_tcp),
 	BPF_MOV64_REG(BPF_REG_2, BPF_REG_0),
 	/* u64 foo; */
 	/* void *target = &foo; */
@@ -339,7 +340,7 @@
 	.insns = {
 	BPF_MOV64_REG(BPF_REG_8, BPF_REG_1),
 	/* struct bpf_sock *sock = bpf_sock_lookup(...); */
-	BPF_SK_LOOKUP,
+	BPF_SK_LOOKUP(sk_lookup_tcp),
 	BPF_MOV64_REG(BPF_REG_2, BPF_REG_0),
 	/* u64 foo; */
 	/* void *target = &foo; */

@@ -7,19 +7,10 @@
 #include "xfs.h"
 #include "xfs_fs.h"
 #include "xfs_format.h"
-#include "xfs_log_format.h"
 #include "xfs_shared.h"
 #include "xfs_trans_resv.h"
 #include "xfs_bit.h"
-#include "xfs_sb.h"
 #include "xfs_mount.h"
-#include "xfs_defer.h"
-#include "xfs_inode.h"
-#include "xfs_btree.h"
-#include "xfs_rmap.h"
-#include "xfs_alloc_btree.h"
-#include "xfs_alloc.h"
-#include "xfs_ialloc.h"
 
 /* Find the size of the AG, in blocks. */
 xfs_agblock_t
@@ -70,6 +61,29 @@ xfs_verify_fsbno(
 	return xfs_verify_agbno(mp, agno, XFS_FSB_TO_AGBNO(mp, fsbno));
 }
 
+/*
+ * Verify that a data device extent is fully contained inside the filesystem,
+ * does not cross an AG boundary, and does not point at static metadata.
+ */
+bool
+xfs_verify_fsbext(
+	struct xfs_mount	*mp,
+	xfs_fsblock_t		fsbno,
+	xfs_fsblock_t		len)
+{
+	if (fsbno + len <= fsbno)
+		return false;
+
+	if (!xfs_verify_fsbno(mp, fsbno))
+		return false;
+
+	if (!xfs_verify_fsbno(mp, fsbno + len - 1))
+		return false;
+
+	return  XFS_FSB_TO_AGNO(mp, fsbno) ==
+		XFS_FSB_TO_AGNO(mp, fsbno + len - 1);
+}
+
 /* Calculate the first and last possible inode number in an AG. */
 void
 xfs_agino_range(
@@ -87,14 +101,14 @@ xfs_agino_range(
 	 * Calculate the first inode, which will be in the first
 	 * cluster-aligned block after the AGFL.
 	 */
-	bno = round_up(XFS_AGFL_BLOCK(mp) + 1, mp->m_cluster_align);
+	bno = round_up(XFS_AGFL_BLOCK(mp) + 1, M_IGEO(mp)->cluster_align);
 	*first = XFS_AGB_TO_AGINO(mp, bno);
 
 	/*
 	 * Calculate the last inode, which will be at the end of the
 	 * last (aligned) cluster that can be allocated in the AG.
 	 */
-	bno = round_down(eoag, mp->m_cluster_align);
+	bno = round_down(eoag, M_IGEO(mp)->cluster_align);
 	*last = XFS_AGB_TO_AGINO(mp, bno) - 1;
 }
 
@@ -184,8 +198,24 @@ xfs_verify_rtbno(
 	return rtbno < mp->m_sb.sb_rblocks;
 }
 
+/* Verify that a realtime device extent is fully contained inside the volume. */
+bool
+xfs_verify_rtext(
+	struct xfs_mount	*mp,
+	xfs_rtblock_t		rtbno,
+	xfs_rtblock_t		len)
+{
+	if (rtbno + len <= rtbno)
+		return false;
+
+	if (!xfs_verify_rtbno(mp, rtbno))
+		return false;
+
+	return xfs_verify_rtbno(mp, rtbno + len - 1);
+}
+
 /* Calculate the range of valid icount values. */
-static void
+void
 xfs_icount_range(
 	struct xfs_mount	*mp,
 	unsigned long long	*min,
@@ -227,4 +257,29 @@ xfs_verify_dablk(
 	xfs_dablk_t		max_dablk = -1U;
 
 	return dabno <= max_dablk;
+}
+
+/* Check that a file block offset does not exceed the maximum. */
+bool
+xfs_verify_fileoff(
+	struct xfs_mount	*mp,
+	xfs_fileoff_t		off)
+{
+	return off <= XFS_MAX_FILEOFF;
+}
+
+/* Check that a range of file block offsets do not exceed the maximum. */
+bool
+xfs_verify_fileext(
+	struct xfs_mount	*mp,
+	xfs_fileoff_t		off,
+	xfs_fileoff_t		len)
+{
+	if (off + len <= off)
+		return false;
+
+	if (!xfs_verify_fileoff(mp, off))
+		return false;
+
+	return xfs_verify_fileoff(mp, off + len - 1);
 }

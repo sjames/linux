@@ -24,6 +24,9 @@
 #ifndef __AMDGPU_IH_H__
 #define __AMDGPU_IH_H__
 
+/* Maximum number of IVs processed at once */
+#define AMDGPU_IH_MAX_NUM_IVS	32
+
 struct amdgpu_device;
 struct amdgpu_iv_entry;
 
@@ -69,6 +72,8 @@ struct amdgpu_ih_funcs {
 int amdgpu_ih_ring_init(struct amdgpu_device *adev, struct amdgpu_ih_ring *ih,
 			unsigned ring_size, bool use_bus_addr);
 void amdgpu_ih_ring_fini(struct amdgpu_device *adev, struct amdgpu_ih_ring *ih);
+void amdgpu_ih_ring_write(struct amdgpu_ih_ring *ih, const uint32_t *iv,
+			  unsigned int num_dw);
 int amdgpu_ih_process(struct amdgpu_device *adev, struct amdgpu_ih_ring *ih);
 
 #endif

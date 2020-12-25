@@ -1,14 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 and
- * only version 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
  */
 
 #include <linux/clk.h>
@@ -455,7 +447,10 @@ static void dsi_pll_28nm_save_state(struct msm_dsi_pll *pll)
 	cached_state->postdiv1 =
 			pll_read(base + REG_DSI_28nm_PHY_PLL_POSTDIV1_CFG);
 	cached_state->byte_mux = pll_read(base + REG_DSI_28nm_PHY_PLL_VREG_CFG);
-	cached_state->vco_rate = clk_hw_get_rate(&pll->clk_hw);
+	if (dsi_pll_28nm_clk_is_enabled(&pll->clk_hw))
+		cached_state->vco_rate = clk_hw_get_rate(&pll->clk_hw);
+	else
+		cached_state->vco_rate = 0;
 }
 
 static int dsi_pll_28nm_restore_state(struct msm_dsi_pll *pll)
@@ -562,9 +557,9 @@ static int pll_28nm_register(struct dsi_pll_28nm *pll_28nm)
 	snprintf(parent1, 32, "dsi%dvco_clk", pll_28nm->id);
 	snprintf(parent2, 32, "dsi%dindirect_path_div2_clk", pll_28nm->id);
 	clks[num++] = clk_register_mux(dev, clk_name,
-			(const char *[]){
+			((const char *[]){
 				parent1, parent2
-			}, 2, CLK_SET_RATE_PARENT, pll_28nm->mmio +
+			}), 2, CLK_SET_RATE_PARENT, pll_28nm->mmio +
 			REG_DSI_28nm_PHY_PLL_VREG_CFG, 1, 1, 0, NULL);
 
 	snprintf(clk_name, 32, "dsi%dpllbyte", pll_28nm->id);

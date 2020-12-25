@@ -2,20 +2,19 @@
 #ifndef _ASM_S390_FTRACE_H
 #define _ASM_S390_FTRACE_H
 
+#define HAVE_FUNCTION_GRAPH_RET_ADDR_PTR
 #define ARCH_SUPPORTS_FTRACE_OPS 1
-
-#if defined(CC_USING_HOTPATCH) || defined(CC_USING_NOP_MCOUNT)
 #define MCOUNT_INSN_SIZE	6
-#else
-#define MCOUNT_INSN_SIZE	24
-#define MCOUNT_RETURN_FIXUP	18
-#endif
 
 #ifndef __ASSEMBLY__
 
+#ifdef CONFIG_CC_IS_CLANG
+/* https://bugs.llvm.org/show_bug.cgi?id=41424 */
+#define ftrace_return_address(n) 0UL
+#else
 #define ftrace_return_address(n) __builtin_return_address(n)
+#endif
 
-void _mcount(void);
 void ftrace_caller(void);
 
 extern char ftrace_graph_caller_end;
@@ -23,11 +22,19 @@ extern unsigned long ftrace_plt;
 
 struct dyn_arch_ftrace { };
 
-#define MCOUNT_ADDR ((unsigned long)_mcount)
+#define MCOUNT_ADDR 0
 #define FTRACE_ADDR ((unsigned long)ftrace_caller)
 
 #define KPROBE_ON_FTRACE_NOP	0
 #define KPROBE_ON_FTRACE_CALL	1
+
+struct module;
+struct dyn_ftrace;
+/*
+ * Either -mhotpatch or -mnop-mcount is used - no explicit init is required
+ */
+static inline int ftrace_init_nop(struct module *mod, struct dyn_ftrace *rec) { return 0; }
+#define ftrace_init_nop ftrace_init_nop
 
 static inline unsigned long ftrace_call_adjust(unsigned long addr)
 {
@@ -42,28 +49,17 @@ struct ftrace_insn {
 static inline void ftrace_generate_nop_insn(struct ftrace_insn *insn)
 {
 #ifdef CONFIG_FUNCTION_TRACER
-#if defined(CC_USING_HOTPATCH) || defined(CC_USING_NOP_MCOUNT)
 	/* brcl 0,0 */
 	insn->opc = 0xc004;
 	insn->disp = 0;
-#else
-	/* jg .+24 */
-	insn->opc = 0xc0f4;
-	insn->disp = MCOUNT_INSN_SIZE / 2;
-#endif
 #endif
 }
 
 static inline int is_ftrace_nop(struct ftrace_insn *insn)
 {
 #ifdef CONFIG_FUNCTION_TRACER
-#if defined(CC_USING_HOTPATCH) || defined(CC_USING_NOP_MCOUNT)
 	if (insn->disp == 0)
 		return 1;
-#else
-	if (insn->disp == MCOUNT_INSN_SIZE / 2)
-		return 1;
-#endif
 #endif
 	return 0;
 }

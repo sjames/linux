@@ -1,8 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (C) ST-Ericsson 2010 - 2013
  * Author: Martin Persson <martin.persson@stericsson.com>
  *         Hongbo Zhang <hongbo.zhang@linaro.org>
- * License Terms: GNU General Public License v2
  *
  * ABX500 does not provide auto ADC, so to monitor the required temperatures,
  * a periodic work is used. It is more important to not wake up the CPU than
@@ -263,7 +263,7 @@ static ssize_t max_alarm_show(struct device *dev,
 static umode_t abx500_attrs_visible(struct kobject *kobj,
 				   struct attribute *attr, int n)
 {
-	struct device *dev = container_of(kobj, struct device, kobj);
+	struct device *dev = kobj_to_dev(kobj);
 	struct abx500_temp *data = dev_get_drvdata(dev);
 
 	if (data->ops.is_visible)

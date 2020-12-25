@@ -79,7 +79,6 @@ EXPORT_SYMBOL(tty_register_ldisc);
 /**
  *	tty_unregister_ldisc	-	unload a line discipline
  *	@disc: ldisc number
- *	@new_ldisc: pointer to the ldisc object
  *
  *	Remove a line discipline from the kernel providing it is not
  *	currently in use.
@@ -136,8 +135,10 @@ static void put_ldops(struct tty_ldisc_ops *ldops)
 	raw_spin_unlock_irqrestore(&tty_ldiscs_lock, flags);
 }
 
+static int tty_ldisc_autoload = IS_BUILTIN(CONFIG_LDISC_AUTOLOAD);
 /**
  *	tty_ldisc_get		-	take a reference to an ldisc
+ *	@tty: tty device
  *	@disc: ldisc number
  *
  *	Takes a reference to a line discipline. Deals with refcounts and
@@ -155,13 +156,6 @@ static void put_ldops(struct tty_ldisc_ops *ldops)
  *	Locking:
  *		takes tty_ldiscs_lock to guard against ldisc races
  */
-
-#if defined(CONFIG_LDISC_AUTOLOAD)
-	#define INITIAL_AUTOLOAD_STATE	1
-#else
-	#define INITIAL_AUTOLOAD_STATE	0
-#endif
-static int tty_ldisc_autoload = INITIAL_AUTOLOAD_STATE;
 
 static struct tty_ldisc *tty_ldisc_get(struct tty_struct *tty, int disc)
 {
@@ -196,7 +190,7 @@ static struct tty_ldisc *tty_ldisc_get(struct tty_struct *tty, int disc)
 	return ld;
 }
 
-/**
+/*
  *	tty_ldisc_put		-	release the ldisc
  *
  *	Complement of tty_ldisc_get().
@@ -256,12 +250,12 @@ const struct seq_operations tty_ldiscs_seq_ops = {
  *	Returns: NULL if the tty has been hungup and not re-opened with
  *		 a new file descriptor, otherwise valid ldisc reference
  *
- *	Note: Must not be called from an IRQ/timer context. The caller
+ *	Note 1: Must not be called from an IRQ/timer context. The caller
  *	must also be careful not to hold other locks that will deadlock
  *	against a discipline change, such as an existing ldisc reference
  *	(which we check for)
  *
- *	Note: a file_operations routine (read/poll/write) should use this
+ *	Note 2: a file_operations routine (read/poll/write) should use this
  *	function to wait for any ldisc lifetime events to finish.
  */
 
@@ -487,7 +481,7 @@ static int tty_ldisc_open(struct tty_struct *tty, struct tty_ldisc *ld)
 
 static void tty_ldisc_close(struct tty_struct *tty, struct tty_ldisc *ld)
 {
-	lockdep_assert_held_exclusive(&tty->ldisc_sem);
+	lockdep_assert_held_write(&tty->ldisc_sem);
 	WARN_ON(!test_bit(TTY_LDISC_OPEN, &tty->flags));
 	clear_bit(TTY_LDISC_OPEN, &tty->flags);
 	if (ld->ops->close)
@@ -509,7 +503,7 @@ static int tty_ldisc_failto(struct tty_struct *tty, int ld)
 	struct tty_ldisc *disc = tty_ldisc_get(tty, ld);
 	int r;
 
-	lockdep_assert_held_exclusive(&tty->ldisc_sem);
+	lockdep_assert_held_write(&tty->ldisc_sem);
 	if (IS_ERR(disc))
 		return PTR_ERR(disc);
 	tty->ldisc = disc;
@@ -547,7 +541,7 @@ static void tty_ldisc_restore(struct tty_struct *tty, struct tty_ldisc *old)
 /**
  *	tty_set_ldisc		-	set line discipline
  *	@tty: the terminal to set
- *	@ldisc: the line discipline
+ *	@disc: the line discipline number
  *
  *	Set the discipline of a tty line. Must be called from a process
  *	context. The ldisc change logic has to protect itself against any
@@ -633,7 +627,7 @@ EXPORT_SYMBOL_GPL(tty_set_ldisc);
  */
 static void tty_ldisc_kill(struct tty_struct *tty)
 {
-	lockdep_assert_held_exclusive(&tty->ldisc_sem);
+	lockdep_assert_held_write(&tty->ldisc_sem);
 	if (!tty->ldisc)
 		return;
 	/*
@@ -681,7 +675,7 @@ int tty_ldisc_reinit(struct tty_struct *tty, int disc)
 	struct tty_ldisc *ld;
 	int retval;
 
-	lockdep_assert_held_exclusive(&tty->ldisc_sem);
+	lockdep_assert_held_write(&tty->ldisc_sem);
 	ld = tty_ldisc_get(tty, disc);
 	if (IS_ERR(ld)) {
 		BUG_ON(disc == N_TTY);
@@ -707,6 +701,7 @@ int tty_ldisc_reinit(struct tty_struct *tty, int disc)
 /**
  *	tty_ldisc_hangup		-	hangup ldisc reset
  *	@tty: tty being hung up
+ *	@reinit: whether to re-initialise the tty
  *
  *	Some tty devices reset their termios when they receive a hangup
  *	event. In that situation we must also switch back to N_TTY properly
@@ -855,8 +850,6 @@ void tty_ldisc_deinit(struct tty_struct *tty)
 	tty->ldisc = NULL;
 }
 
-static int zero;
-static int one = 1;
 static struct ctl_table tty_table[] = {
 	{
 		.procname	= "ldisc_autoload",
@@ -864,8 +857,8 @@ static struct ctl_table tty_table[] = {
 		.maxlen		= sizeof(tty_ldisc_autoload),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec,
-		.extra1		= &zero,
-		.extra2		= &one,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
 	},
 	{ }
 };

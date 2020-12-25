@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Driver for the Micron P320 SSD
  *   Copyright (C) 2011 Micron Technology, Inc.
@@ -5,17 +6,6 @@
  * Portions of this code were derived from works subjected to the
  * following copyright:
  *    Copyright (C) 2009 Integrated Device Technology, Inc.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
  */
 
 #include <linux/pci.h>
@@ -139,7 +129,7 @@ struct mtip_compat_ide_task_request_s {
 /*
  * This function check_for_surprise_removal is called
  * while card is removed from the system and it will
- * read the vendor id from the configration space
+ * read the vendor id from the configuration space
  *
  * @pdev Pointer to the pci_dev structure.
  *
@@ -502,7 +492,8 @@ static void mtip_complete_command(struct mtip_cmd *cmd, blk_status_t status)
 	struct request *req = blk_mq_rq_from_pdu(cmd);
 
 	cmd->status = status;
-	blk_mq_complete_request(req);
+	if (likely(!blk_should_fake_timeout(req->q)))
+		blk_mq_complete_request(req);
 }
 
 /*
@@ -1192,14 +1183,6 @@ static int mtip_get_identify(struct mtip_port *port, void __user *user_buffer)
 	else
 		clear_bit(MTIP_DDF_SEC_LOCK_BIT, &port->dd->dd_flag);
 
-#ifdef MTIP_TRIM /* Disabling TRIM support temporarily */
-	/* Demux ID.DRAT & ID.RZAT to determine trim support */
-	if (port->identify[69] & (1 << 14) && port->identify[69] & (1 << 5))
-		port->dd->trim_supp = true;
-	else
-#endif
-		port->dd->trim_supp = false;
-
 	/* Set the identify buffer as valid. */
 	port->identify_valid = 1;
 
@@ -1384,77 +1367,6 @@ static int mtip_get_smart_attr(struct mtip_port *port, unsigned int id,
 	}
 
 	return rv;
-}
-
-/*
- * Trim unused sectors
- *
- * @dd		pointer to driver_data structure
- * @lba		starting lba
- * @len		# of 512b sectors to trim
- */
-static blk_status_t mtip_send_trim(struct driver_data *dd, unsigned int lba,
-		unsigned int len)
-{
-	u64 tlba, tlen, sect_left;
-	struct mtip_trim_entry *buf;
-	dma_addr_t dma_addr;
-	struct host_to_dev_fis fis;
-	blk_status_t ret = BLK_STS_OK;
-	int i;
-
-	if (!len || dd->trim_supp == false)
-		return BLK_STS_IOERR;
-
-	/* Trim request too big */
-	WARN_ON(len > (MTIP_MAX_TRIM_ENTRY_LEN * MTIP_MAX_TRIM_ENTRIES));
-
-	/* Trim request not aligned on 4k boundary */
-	WARN_ON(len % 8 != 0);
-
-	/* Warn if vu_trim structure is too big */
-	WARN_ON(sizeof(struct mtip_trim) > ATA_SECT_SIZE);
-
-	/* Allocate a DMA buffer for the trim structure */
-	buf = dma_alloc_coherent(&dd->pdev->dev, ATA_SECT_SIZE, &dma_addr,
-								GFP_KERNEL);
-	if (!buf)
-		return BLK_STS_RESOURCE;
-	memset(buf, 0, ATA_SECT_SIZE);
-
-	for (i = 0, sect_left = len, tlba = lba;
-			i < MTIP_MAX_TRIM_ENTRIES && sect_left;
-			i++) {
-		tlen = (sect_left >= MTIP_MAX_TRIM_ENTRY_LEN ?
-					MTIP_MAX_TRIM_ENTRY_LEN :
-					sect_left);
-		buf[i].lba = cpu_to_le32(tlba);
-		buf[i].range = cpu_to_le16(tlen);
-		tlba += tlen;
-		sect_left -= tlen;
-	}
-	WARN_ON(sect_left != 0);
-
-	/* Build the fis */
-	memset(&fis, 0, sizeof(struct host_to_dev_fis));
-	fis.type       = 0x27;
-	fis.opts       = 1 << 7;
-	fis.command    = 0xfb;
-	fis.features   = 0x60;
-	fis.sect_count = 1;
-	fis.device     = ATA_DEVICE_OBS;
-
-	if (mtip_exec_internal_command(dd->port,
-					&fis,
-					5,
-					dma_addr,
-					ATA_SECT_SIZE,
-					0,
-					MTIP_TRIM_TIMEOUT_MS) < 0)
-		ret = BLK_STS_IOERR;
-
-	dma_free_coherent(&dd->pdev->dev, ATA_SECT_SIZE, buf, dma_addr);
-	return ret;
 }
 
 /*
@@ -1666,7 +1578,6 @@ static int exec_drive_command(struct mtip_port *port, u8 *command,
 				ATA_SECT_SIZE * xfer_sz);
 			return -ENOMEM;
 		}
-		memset(buf, 0, ATA_SECT_SIZE * xfer_sz);
 	}
 
 	/* Build the FIS. */
@@ -2865,7 +2776,6 @@ static int mtip_dma_alloc(struct driver_data *dd)
 					&port->block1_dma, GFP_KERNEL);
 	if (!port->block1)
 		return -ENOMEM;
-	memset(port->block1, 0, BLOCK_DMA_ALLOC_SZ);
 
 	/* Allocate dma memory for command list */
 	port->command_list =
@@ -2878,7 +2788,6 @@ static int mtip_dma_alloc(struct driver_data *dd)
 		port->block1_dma = 0;
 		return -ENOMEM;
 	}
-	memset(port->command_list, 0, AHCI_CMD_TBL_SZ);
 
 	/* Setup all pointers into first DMA region */
 	port->rxfis         = port->block1 + AHCI_RX_FIS_OFFSET;
@@ -3590,8 +3499,6 @@ static blk_status_t mtip_queue_rq(struct blk_mq_hw_ctx *hctx,
 
 	blk_mq_start_request(rq);
 
-	if (req_op(rq) == REQ_OP_DISCARD)
-		return mtip_send_trim(dd, blk_rq_pos(rq), blk_rq_sectors(rq));
 	mtip_hw_submit_io(dd, rq, cmd, hctx);
 	return BLK_STS_OK;
 }
@@ -3619,8 +3526,6 @@ static int mtip_init_cmd(struct blk_mq_tag_set *set, struct request *rq,
 			&cmd->command_dma, GFP_KERNEL);
 	if (!cmd->command)
 		return -ENOMEM;
-
-	memset(cmd->command, 0, CMD_DMA_ALLOC_SZ);
 
 	sg_init_table(cmd->sg, MTIP_MAX_SG);
 	return 0;
@@ -3767,15 +3672,8 @@ skip_create_disk:
 	blk_queue_physical_block_size(dd->queue, 4096);
 	blk_queue_max_hw_sectors(dd->queue, 0xffff);
 	blk_queue_max_segment_size(dd->queue, 0x400000);
+	dma_set_max_seg_size(&dd->pdev->dev, 0x400000);
 	blk_queue_io_min(dd->queue, 4096);
-
-	/* Signal trim support */
-	if (dd->trim_supp == true) {
-		blk_queue_flag_set(QUEUE_FLAG_DISCARD, dd->queue);
-		dd->queue->limits.discard_granularity = 4096;
-		blk_queue_max_discard_sectors(dd->queue,
-			MTIP_MAX_TRIM_ENTRY_LEN * MTIP_MAX_TRIM_ENTRIES);
-	}
 
 	/* Set the capacity of the device in 512 byte sectors. */
 	if (!(mtip_hw_get_capacity(dd, &capacity))) {
@@ -3789,7 +3687,6 @@ skip_create_disk:
 	/* Enable the block device and add it to /dev */
 	device_add_disk(&dd->pdev->dev, dd->disk, NULL);
 
-	dd->bdev = bdget_disk(dd->disk, 0);
 	/*
 	 * Now that the disk is active, initialize any sysfs attributes
 	 * managed by the protocol layer.
@@ -3823,9 +3720,6 @@ start_service_thread:
 	return rv;
 
 kthread_run_error:
-	bdput(dd->bdev);
-	dd->bdev = NULL;
-
 	/* Delete our gendisk. This also removes the device from /dev */
 	del_gendisk(dd->disk);
 
@@ -3906,14 +3800,6 @@ static int mtip_block_remove(struct driver_data *dd)
 	blk_mq_tagset_busy_iter(&dd->tags, mtip_no_dev_cleanup, dd);
 	blk_mq_unquiesce_queue(dd->queue);
 
-	/*
-	 * Delete our gendisk structure. This also removes the device
-	 * from /dev
-	 */
-	if (dd->bdev) {
-		bdput(dd->bdev);
-		dd->bdev = NULL;
-	}
 	if (dd->disk) {
 		if (test_bit(MTIP_DDF_INIT_DONE_BIT, &dd->dd_flag))
 			del_gendisk(dd->disk);
@@ -4307,9 +4193,6 @@ static void mtip_pci_remove(struct pci_dev *pdev)
 		msleep(20);
 	} while (atomic_read(&dd->irq_workers_active) != 0 &&
 		time_before(jiffies, to));
-
-	if (!dd->sr)
-		fsync_bdev(dd->bdev);
 
 	if (atomic_read(&dd->irq_workers_active) != 0) {
 		dev_warn(&dd->pdev->dev,

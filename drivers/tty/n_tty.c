@@ -84,7 +84,7 @@
 #ifdef N_TTY_TRACE
 # define n_tty_trace(f, args...)	trace_printk(f, ##args)
 #else
-# define n_tty_trace(f, args...)
+# define n_tty_trace(f, args...)	no_printk(f, ##args)
 #endif
 
 struct n_tty_data {
@@ -322,7 +322,7 @@ static inline void put_tty_queue(unsigned char c, struct n_tty_data *ldata)
 
 /**
  *	reset_buffer_flags	-	reset buffer state
- *	@tty: terminal to reset
+ *	@ldata: line disc data to reset
  *
  *	Reset the read buffer counters and clear the flags.
  *	Called from n_tty_open() and n_tty_flush_buffer().
@@ -396,6 +396,7 @@ static inline int is_utf8_continuation(unsigned char c)
 /**
  *	is_continuation		-	multibyte check
  *	@c: byte to check
+ *	@tty: terminal device
  *
  *	Returns true if the utf8 character 'c' is a multibyte continuation
  *	character and the terminal is in unicode mode.
@@ -550,9 +551,9 @@ static ssize_t process_output_block(struct tty_struct *tty,
 	mutex_lock(&ldata->output_lock);
 
 	space = tty_write_room(tty);
-	if (!space) {
+	if (space <= 0) {
 		mutex_unlock(&ldata->output_lock);
-		return 0;
+		return space;
 	}
 	if (nr > space)
 		nr = space;
@@ -654,9 +655,9 @@ static size_t __process_echoes(struct tty_struct *tty)
 			op = echo_buf(ldata, tail + 1);
 
 			switch (op) {
+			case ECHO_OP_ERASE_TAB: {
 				unsigned int num_chars, num_bs;
 
-			case ECHO_OP_ERASE_TAB:
 				if (MASK(ldata->echo_commit) == MASK(tail + 2))
 					goto not_yet_stored;
 				num_chars = echo_buf(ldata, tail + 2);
@@ -687,7 +688,7 @@ static size_t __process_echoes(struct tty_struct *tty)
 				}
 				tail += 3;
 				break;
-
+			}
 			case ECHO_OP_SET_CANON_COL:
 				ldata->canon_column = ldata->column;
 				tail += 2;
@@ -906,7 +907,7 @@ static void echo_erase_tab(unsigned int num_chars, int after_tab,
 /**
  *	echo_char_raw	-	echo a character raw
  *	@c: unicode byte to echo
- *	@tty: terminal device
+ *	@ldata: line disc data
  *
  *	Echo user input back onto the screen. This must be called only when
  *	L_ECHO(tty) is true. Called from the driver receive_buf path.
@@ -1668,6 +1669,7 @@ static void __receive_buf(struct tty_struct *tty, const unsigned char *cp,
  *	@cp: input chars
  *	@fp: flags for each char (if NULL, all chars are TTY_NORMAL)
  *	@count: number of input chars in @cp
+ *	@flow: enable flow control
  *
  *	Called by the terminal driver when a block of characters has
  *	been received. This function must be called from soft contexts
