@@ -121,7 +121,7 @@ static int pvrdma_init_device(struct pvrdma_dev *dev)
 	return 0;
 }
 
-static int pvrdma_port_immutable(struct ib_device *ibdev, u8 port_num,
+static int pvrdma_port_immutable(struct ib_device *ibdev, u32 port_num,
 				 struct ib_port_immutable *immutable)
 {
 	struct pvrdma_dev *dev = to_vdev(ibdev);
@@ -162,6 +162,7 @@ static const struct ib_device_ops pvrdma_dev_ops = {
 	.destroy_ah = pvrdma_destroy_ah,
 	.destroy_cq = pvrdma_destroy_cq,
 	.destroy_qp = pvrdma_destroy_qp,
+	.device_group = &pvrdma_attr_group,
 	.get_dev_fw_str = pvrdma_get_fw_ver_str,
 	.get_dma_mr = pvrdma_get_dma_mr,
 	.get_link_layer = pvrdma_port_link_layer,
@@ -240,7 +241,6 @@ static int pvrdma_register_device(struct pvrdma_dev *dev)
 	if (ret)
 		goto err_srq_free;
 	spin_lock_init(&dev->srq_tbl_lock);
-	rdma_set_device_sysfs_group(&dev->ib_dev, &pvrdma_attr_group);
 
 	ret = ib_register_device(&dev->ib_dev, "vmw_pvrdma%d", &dev->pdev->dev);
 	if (ret)
@@ -474,7 +474,6 @@ static irqreturn_t pvrdma_intrx_handler(int irq, void *dev_id)
 	int ring_slots = (dev->dsr->cq_ring_pages.num_pages - 1) * PAGE_SIZE /
 			 sizeof(struct pvrdma_cqne);
 	unsigned int head;
-	unsigned long flags;
 
 	dev_dbg(&dev->pdev->dev, "interrupt x (completion) handler\n");
 
@@ -483,11 +482,11 @@ static irqreturn_t pvrdma_intrx_handler(int irq, void *dev_id)
 		struct pvrdma_cq *cq;
 
 		cqne = get_cqne(dev, head);
-		spin_lock_irqsave(&dev->cq_tbl_lock, flags);
+		spin_lock(&dev->cq_tbl_lock);
 		cq = dev->cq_tbl[cqne->info % dev->dsr->caps.max_cq];
 		if (cq)
 			refcount_inc(&cq->refcnt);
-		spin_unlock_irqrestore(&dev->cq_tbl_lock, flags);
+		spin_unlock(&dev->cq_tbl_lock);
 
 		if (cq && cq->ibcq.comp_handler)
 			cq->ibcq.comp_handler(&cq->ibcq, cq->ibcq.cq_context);

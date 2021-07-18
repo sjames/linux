@@ -157,7 +157,7 @@ static void qeth_l2_drain_rx_mode_cache(struct qeth_card *card)
 
 static void qeth_l2_fill_header(struct qeth_qdio_out_q *queue,
 				struct qeth_hdr *hdr, struct sk_buff *skb,
-				int ipv, unsigned int data_len)
+				__be16 proto, unsigned int data_len)
 {
 	int cast_type = qeth_get_ether_cast_type(skb);
 	struct vlan_ethhdr *veth = vlan_eth_hdr(skb);
@@ -169,7 +169,7 @@ static void qeth_l2_fill_header(struct qeth_qdio_out_q *queue,
 	} else {
 		hdr->hdr.l2.id = QETH_HEADER_TYPE_LAYER2;
 		if (skb->ip_summed == CHECKSUM_PARTIAL)
-			qeth_tx_csum(skb, &hdr->hdr.l2.flags[1], ipv);
+			qeth_tx_csum(skb, &hdr->hdr.l2.flags[1], proto);
 	}
 
 	/* set byte byte 3 to casting flags */
@@ -551,7 +551,7 @@ static netdev_tx_t qeth_l2_hard_start_xmit(struct sk_buff *skb,
 	if (IS_OSN(card))
 		rc = qeth_l2_xmit_osn(card, skb, queue);
 	else
-		rc = qeth_xmit(card, skb, queue, qeth_get_ip_version(skb),
+		rc = qeth_xmit(card, skb, queue, vlan_get_protocol(skb),
 			       qeth_l2_fill_header);
 
 	if (!rc)
@@ -805,8 +805,6 @@ static int qeth_l2_bridge_setlink(struct net_device *dev, struct nlmsghdr *nlh,
 
 	if (!netif_device_present(dev))
 		return -ENODEV;
-	if (!(priv->brport_hw_features))
-		return -EOPNOTSUPP;
 
 	nlmsg_for_each_attr(attr, nlh, sizeof(struct ifinfomsg), rem1) {
 		if (nla_type(attr) == IFLA_PROTINFO) {
@@ -832,6 +830,16 @@ static int qeth_l2_bridge_setlink(struct net_device *dev, struct nlmsghdr *nlh,
 		return 0;
 	if (!bp_tb[IFLA_BRPORT_LEARNING_SYNC])
 		return -EINVAL;
+	if (!(priv->brport_hw_features & BR_LEARNING_SYNC)) {
+		NL_SET_ERR_MSG_ATTR(extack, bp_tb[IFLA_BRPORT_LEARNING_SYNC],
+				    "Operation not supported by HW");
+		return -EOPNOTSUPP;
+	}
+	if (!IS_ENABLED(CONFIG_NET_SWITCHDEV)) {
+		NL_SET_ERR_MSG_ATTR(extack, bp_tb[IFLA_BRPORT_LEARNING_SYNC],
+				    "Requires NET_SWITCHDEV");
+		return -EOPNOTSUPP;
+	}
 	enable = !!nla_get_u8(bp_tb[IFLA_BRPORT_LEARNING_SYNC]);
 
 	if (enable == !!(priv->brport_features & BR_LEARNING_SYNC))
@@ -2208,7 +2216,7 @@ static void qeth_l2_remove_device(struct ccwgroup_device *gdev)
 	wait_event(card->wait_q, qeth_threads_running(card, 0xffffffff) == 0);
 
 	if (gdev->state == CCWGROUP_ONLINE)
-		qeth_set_offline(card, false);
+		qeth_set_offline(card, card->discipline, false);
 
 	cancel_work_sync(&card->close_dev_work);
 	if (card->dev->reg_state == NETREG_REGISTERED)

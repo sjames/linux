@@ -38,7 +38,7 @@ static inline int queue_free_slots(struct hl_hw_queue *q, u32 queue_len)
 		return (abs(delta) - queue_len);
 }
 
-void hl_int_hw_queue_update_ci(struct hl_cs *cs)
+void hl_hw_queue_update_ci(struct hl_cs *cs)
 {
 	struct hl_device *hdev = cs->ctx->hdev;
 	struct hl_hw_queue *q;
@@ -53,8 +53,13 @@ void hl_int_hw_queue_update_ci(struct hl_cs *cs)
 	if (!hdev->asic_prop.max_queues || q->queue_type == QUEUE_TYPE_HW)
 		return;
 
+	/* We must increment CI for every queue that will never get a
+	 * completion, there are 2 scenarios this can happen:
+	 * 1. All queues of a non completion CS will never get a completion.
+	 * 2. Internal queues never gets completion.
+	 */
 	for (i = 0 ; i < hdev->asic_prop.max_queues ; i++, q++) {
-		if (q->queue_type == QUEUE_TYPE_INT)
+		if (!cs_needs_completion(cs) || q->queue_type == QUEUE_TYPE_INT)
 			atomic_add(cs->jobs_in_queue_cnt[i], &q->ci);
 	}
 }
@@ -292,6 +297,10 @@ static void ext_queue_schedule_job(struct hl_cs_job *job)
 	len = job->job_cb_size;
 	ptr = cb->bus_address;
 
+	/* Skip completion flow in case this is a non completion CS */
+	if (!cs_needs_completion(job->cs))
+		goto submit_bd;
+
 	cq_pkt.data = cpu_to_le32(
 			((q->pi << CQ_ENTRY_SHADOW_INDEX_SHIFT)
 				& CQ_ENTRY_SHADOW_INDEX_MASK) |
@@ -318,6 +327,7 @@ static void ext_queue_schedule_job(struct hl_cs_job *job)
 
 	cq->pi = hl_cq_inc_ptr(cq->pi);
 
+submit_bd:
 	ext_and_hw_queue_submit_bd(hdev, q, ctl, len, ptr);
 }
 
@@ -400,45 +410,34 @@ static void hw_queue_schedule_job(struct hl_cs_job *job)
 	ext_and_hw_queue_submit_bd(hdev, q, ctl, len, ptr);
 }
 
-static void init_signal_cs(struct hl_device *hdev,
+static int init_signal_cs(struct hl_device *hdev,
 		struct hl_cs_job *job, struct hl_cs_compl *cs_cmpl)
 {
 	struct hl_sync_stream_properties *prop;
 	struct hl_hw_sob *hw_sob;
 	u32 q_idx;
+	int rc = 0;
 
 	q_idx = job->hw_queue_id;
 	prop = &hdev->kernel_queues[q_idx].sync_stream_prop;
 	hw_sob = &prop->hw_sob[prop->curr_sob_offset];
 
 	cs_cmpl->hw_sob = hw_sob;
-	cs_cmpl->sob_val = prop->next_sob_val++;
+	cs_cmpl->sob_val = prop->next_sob_val;
 
 	dev_dbg(hdev->dev,
 		"generate signal CB, sob_id: %d, sob val: 0x%x, q_idx: %d\n",
 		cs_cmpl->hw_sob->sob_id, cs_cmpl->sob_val, q_idx);
 
+	/* we set an EB since we must make sure all oeprations are done
+	 * when sending the signal
+	 */
 	hdev->asic_funcs->gen_signal_cb(hdev, job->patched_cb,
-				cs_cmpl->hw_sob->sob_id, 0);
+				cs_cmpl->hw_sob->sob_id, 0, true);
 
-	kref_get(&hw_sob->kref);
+	rc = hl_cs_signal_sob_wraparound_handler(hdev, q_idx, &hw_sob, 1);
 
-	/* check for wraparound */
-	if (prop->next_sob_val == HL_MAX_SOB_VAL) {
-		/*
-		 * Decrement as we reached the max value.
-		 * The release function won't be called here as we've
-		 * just incremented the refcount.
-		 */
-		kref_put(&hw_sob->kref, hl_sob_reset_error);
-		prop->next_sob_val = 1;
-		/* only two SOBs are currently in use */
-		prop->curr_sob_offset =
-			(prop->curr_sob_offset + 1) % HL_RSVD_SOBS;
-
-		dev_dbg(hdev->dev, "switched to SOB %d, q_idx: %d\n",
-				prop->curr_sob_offset, q_idx);
-	}
+	return rc;
 }
 
 static void init_wait_cs(struct hl_device *hdev, struct hl_cs *cs,
@@ -491,22 +490,25 @@ static void init_wait_cs(struct hl_device *hdev, struct hl_cs *cs,
  *
  * H/W queues spinlock should be taken before calling this function
  */
-static void init_signal_wait_cs(struct hl_cs *cs)
+static int init_signal_wait_cs(struct hl_cs *cs)
 {
 	struct hl_ctx *ctx = cs->ctx;
 	struct hl_device *hdev = ctx->hdev;
 	struct hl_cs_job *job;
 	struct hl_cs_compl *cs_cmpl =
 			container_of(cs->fence, struct hl_cs_compl, base_fence);
+	int rc = 0;
 
 	/* There is only one job in a signal/wait CS */
 	job = list_first_entry(&cs->job_list, struct hl_cs_job,
 				cs_node);
 
 	if (cs->type & CS_TYPE_SIGNAL)
-		init_signal_cs(hdev, job, cs_cmpl);
+		rc = init_signal_cs(hdev, job, cs_cmpl);
 	else if (cs->type & CS_TYPE_WAIT)
 		init_wait_cs(hdev, cs, job, cs_cmpl);
+
+	return rc;
 }
 
 /*
@@ -522,6 +524,7 @@ int hl_hw_queue_schedule_cs(struct hl_cs *cs)
 	struct hl_cs_job *job, *tmp;
 	struct hl_hw_queue *q;
 	int rc = 0, i, cq_cnt;
+	bool first_entry;
 	u32 max_queues;
 
 	cntr = &hdev->aggregated_cs_counters;
@@ -545,7 +548,9 @@ int hl_hw_queue_schedule_cs(struct hl_cs *cs)
 			switch (q->queue_type) {
 			case QUEUE_TYPE_EXT:
 				rc = ext_queue_sanity_checks(hdev, q,
-						cs->jobs_in_queue_cnt[i], true);
+						cs->jobs_in_queue_cnt[i],
+						cs_needs_completion(cs) ?
+								true : false);
 				break;
 			case QUEUE_TYPE_INT:
 				rc = int_queue_sanity_checks(hdev, q,
@@ -574,32 +579,55 @@ int hl_hw_queue_schedule_cs(struct hl_cs *cs)
 		}
 	}
 
-	if ((cs->type == CS_TYPE_SIGNAL) || (cs->type == CS_TYPE_WAIT))
-		init_signal_wait_cs(cs);
-	else if (cs->type == CS_TYPE_COLLECTIVE_WAIT)
+	if ((cs->type == CS_TYPE_SIGNAL) || (cs->type == CS_TYPE_WAIT)) {
+		rc = init_signal_wait_cs(cs);
+		if (rc) {
+			dev_err(hdev->dev, "Failed to submit signal cs\n");
+			goto unroll_cq_resv;
+		}
+	} else if (cs->type == CS_TYPE_COLLECTIVE_WAIT)
 		hdev->asic_funcs->collective_wait_init_cs(cs);
 
+
 	spin_lock(&hdev->cs_mirror_lock);
+
+	/* Verify staged CS exists and add to the staged list */
+	if (cs->staged_cs && !cs->staged_first) {
+		struct hl_cs *staged_cs;
+
+		staged_cs = hl_staged_cs_find_first(hdev, cs->staged_sequence);
+		if (!staged_cs) {
+			dev_err(hdev->dev,
+				"Cannot find staged submission sequence %llu",
+				cs->staged_sequence);
+			rc = -EINVAL;
+			goto unlock_cs_mirror;
+		}
+
+		if (is_staged_cs_last_exists(hdev, staged_cs)) {
+			dev_err(hdev->dev,
+				"Staged submission sequence %llu already submitted",
+				cs->staged_sequence);
+			rc = -EINVAL;
+			goto unlock_cs_mirror;
+		}
+
+		list_add_tail(&cs->staged_cs_node, &staged_cs->staged_cs_node);
+	}
+
 	list_add_tail(&cs->mirror_node, &hdev->cs_mirror_list);
 
 	/* Queue TDR if the CS is the first entry and if timeout is wanted */
+	first_entry = list_first_entry(&hdev->cs_mirror_list,
+					struct hl_cs, mirror_node) == cs;
 	if ((hdev->timeout_jiffies != MAX_SCHEDULE_TIMEOUT) &&
-			(list_first_entry(&hdev->cs_mirror_list,
-					struct hl_cs, mirror_node) == cs)) {
+				first_entry && cs_needs_timeout(cs)) {
 		cs->tdr_active = true;
-		schedule_delayed_work(&cs->work_tdr, hdev->timeout_jiffies);
+		schedule_delayed_work(&cs->work_tdr, cs->timeout_jiffies);
 
 	}
 
 	spin_unlock(&hdev->cs_mirror_lock);
-
-	if (!hdev->cs_active_cnt++) {
-		struct hl_device_idle_busy_ts *ts;
-
-		ts = &hdev->idle_busy_ts_arr[hdev->idle_busy_ts_idx];
-		ts->busy_to_idle_ts = ktime_set(0, 0);
-		ts->idle_to_busy_ts = ktime_get();
-	}
 
 	list_for_each_entry_safe(job, tmp, &cs->job_list, cs_node)
 		switch (job->queue_type) {
@@ -620,6 +648,8 @@ int hl_hw_queue_schedule_cs(struct hl_cs *cs)
 
 	goto out;
 
+unlock_cs_mirror:
+	spin_unlock(&hdev->cs_mirror_lock);
 unroll_cq_resv:
 	q = &hdev->kernel_queues[0];
 	for (i = 0 ; (i < max_queues) && (cq_cnt > 0) ; i++, q++) {

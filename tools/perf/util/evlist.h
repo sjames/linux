@@ -50,7 +50,6 @@ enum bkw_mmap_state {
 
 struct evlist {
 	struct perf_evlist core;
-	int		 nr_groups;
 	bool		 enabled;
 	int		 id_pos;
 	int		 is_pos;
@@ -110,6 +109,8 @@ int __evlist__add_default_attrs(struct evlist *evlist,
 #define evlist__add_default_attrs(evlist, array) \
 	__evlist__add_default_attrs(evlist, array, ARRAY_SIZE(array))
 
+int arch_evlist__add_default_attrs(struct evlist *evlist);
+
 int evlist__add_dummy(struct evlist *evlist);
 
 int evlist__add_sb_event(struct evlist *evlist, struct perf_event_attr *attr,
@@ -141,6 +142,10 @@ struct evsel *evlist__find_tracepoint_by_name(struct evlist *evlist, const char 
 
 int evlist__add_pollfd(struct evlist *evlist, int fd);
 int evlist__filter_pollfd(struct evlist *evlist, short revents_and_mask);
+
+#ifdef HAVE_EVENTFD_SUPPORT
+int evlist__add_wakeup_eventfd(struct evlist *evlist, int fd);
+#endif
 
 int evlist__poll(struct evlist *evlist, int timeout);
 
@@ -196,7 +201,6 @@ void evlist__set_selected(struct evlist *evlist, struct evsel *evsel);
 int evlist__create_maps(struct evlist *evlist, struct target *target);
 int evlist__apply_filters(struct evlist *evlist, struct evsel **err_evsel);
 
-void __evlist__set_leader(struct list_head *list);
 void evlist__set_leader(struct evlist *evlist);
 
 u64 __evlist__combined_sample_type(struct evlist *evlist);
@@ -330,6 +334,9 @@ struct evsel *evlist__reset_weak_group(struct evlist *evlist, struct evsel *evse
 #define EVLIST_CTL_CMD_DISABLE_TAG "disable"
 #define EVLIST_CTL_CMD_ACK_TAG     "ack\n"
 #define EVLIST_CTL_CMD_SNAPSHOT_TAG "snapshot"
+#define EVLIST_CTL_CMD_EVLIST_TAG "evlist"
+#define EVLIST_CTL_CMD_STOP_TAG "stop"
+#define EVLIST_CTL_CMD_PING_TAG "ping"
 
 #define EVLIST_CTL_CMD_MAX_LEN 64
 
@@ -339,6 +346,9 @@ enum evlist_ctl_cmd {
 	EVLIST_CTL_CMD_DISABLE,
 	EVLIST_CTL_CMD_ACK,
 	EVLIST_CTL_CMD_SNAPSHOT,
+	EVLIST_CTL_CMD_EVLIST,
+	EVLIST_CTL_CMD_STOP,
+	EVLIST_CTL_CMD_PING,
 };
 
 int evlist__parse_control(const char *str, int *ctl_fd, int *ctl_fd_ack, bool *ctl_fd_close);
@@ -353,4 +363,7 @@ int evlist__ctlfd_ack(struct evlist *evlist);
 #define EVLIST_DISABLED_MSG "Events disabled\n"
 
 struct evsel *evlist__find_evsel(struct evlist *evlist, int idx);
+
+int evlist__scnprintf_evsels(struct evlist *evlist, size_t size, char *bf);
+void evlist__check_mem_load_aux(struct evlist *evlist);
 #endif /* __PERF_EVLIST_H */
